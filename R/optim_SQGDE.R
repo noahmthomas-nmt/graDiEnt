@@ -72,20 +72,76 @@ optim_SQGDE = function(ObjFun, control_params = GetAlgoParams(), ...){
                    nrow = control_params$n_iters_per_particle,
                    ncol = control_params$n_particles)
 
+  # cluster initialization
+  if(!control_params$parallel_type=='none'){
+
+    message(paste0("initalizing ",
+                   control_params$parallel_type, " cluser with ",
+                   control_params$n_cores_use, " cores"))
+
+    doParallel::registerDoParallel(control_params$n_cores_use)
+    if(control_params$parallel_type == "PSOCK"){
+      cl_use = parallel::makePSOCKcluster(names = control_params$n_cores_use)
+    }else if("FORK"){
+      cl_use = parallel::makeForkCluster(control_params$n_cores_use)
+    }
+
+    parallel::clusterExport(cl_use,
+                            varlist = control_params$varlist)
+  }
+
   # pop initialization
   message('initalizing population...')
-  for(pmem_index in 1:control_params$n_particles){
+  if(control_params$parallel_type=='none'){
+    # pop initialization sequentially
+    for(pmem_index in 1:control_params$n_particles){
+      count = 0 # establish a count variable to avoid infinite run time
+      while(weights[1,pmem_index]==Inf) {
+
+        # only sample the particles left to init
+        particles[1, pmem_index, ] =
+          stats::rnorm(control_params$n_params * length(pmem_index),
+          rep(x = control_params$init_center, each = length(pmem_index)),
+          rep(x = control_params$init_sd, each = length(pmem_index)))
+
+        weights[1, pmem_index] = ObjFun(particles[1, pmem_index, ], ...)
+
+        # catcha NA's and Infinity and assign worst possible value
+        if(!is.finite(weights[1, pmem_index])){
+          weights[1, pmem_index] = Inf
+        }
+        count = count + 1
+        if(count>control_params$give_up_init){
+          stop('population initialization failed.
+        inspect objective function or change init_center/init_sd to sample more
+             likely parameter values')
+        }
+      }
+      message(paste0(pmem_index, " / ", control_params$n_particles))
+    }
+  } else {
+    # pop initialization in parallel
     count = 0 # establish a count variable to avoid infinite run time
-    while(weights[1,pmem_index]==Inf) {
-      particles[1, pmem_index, ] = stats::rnorm(control_params$n_params,
-                                                control_params$init_center,
-                                                control_params$init_sd)
+    weights[1,] <- Inf # initialize to worst possible value
+    while(any(!is.finite(weights[1,]))) {
+      # determine which indices still need init
+      pmem_index <- which(weights[1,]==Inf)
+      message(paste0(length(pmem_index), " / ", control_params$n_particles, " left"))
+      # sample from init distribution
+      particles[1, pmem_index, ] =
+        stats::rnorm(control_params$n_params * length(pmem_index),
+                     rep(x = control_params$init_center, each = length(pmem_index)),
+                     rep(x = control_params$init_sd, each = length(pmem_index)))
+      # parallel apply ObjFun on needed particles only
+      weights[1, pmem_index] <-
+        parallel::parApply(cl = cl_use,
+                           X = particles[1, pmem_index,],
+                           MARGIN = c(1),
+                           FUN = ObjFun, ...)
 
-      weights[1, pmem_index] = ObjFun(particles[1, pmem_index, ], ...)
-
-      # catcha NA's and Infinity and assign worst possible value
-      if(!is.finite(weights[1, pmem_index])){
-        weights[1, pmem_index] = Inf
+      # catch NA's and Infinity and assign worst possible value
+      if(any(!is.finite(weights[1, pmem_index]))){
+        weights[1, any(!is.finite(weights[1, pmem_index]))] = Inf
       }
       count = count + 1
       if(count>control_params$give_up_init){
@@ -94,7 +150,6 @@ optim_SQGDE = function(ObjFun, control_params = GetAlgoParams(), ...){
              likely parameter values')
       }
     }
-    message(paste0(pmem_index, " / ", control_params$n_particles))
   }
   message('population initialization complete  :)')
 
@@ -107,20 +162,6 @@ optim_SQGDE = function(ObjFun, control_params = GetAlgoParams(), ...){
   }
   if(control_params$adapt_scheme=='current'){
     AdaptSQGDE = SQG_DE_bin_1_curr
-  }
-
-  # cluster initialization
-  if(!control_params$parallel_type=='none'){
-
-    message(paste0("initalizing ",
-                 control_params$parallel_type, " cluser with ",
-                 control_params$n_cores_use, " cores"))
-
-    doParallel::registerDoParallel(control_params$n_cores_use)
-    cl_use = parallel::makeCluster(control_params$n_cores_use,
-                                   type = control_params$parallel_type)
-    parallel::clusterExport(cl_use,
-                            varlist = control_params$varlist)
   }
 
   message("running SQG-DE...")
@@ -146,15 +187,17 @@ optim_SQGDE = function(ObjFun, control_params = GetAlgoParams(), ...){
                   control_params$n_params+1, byrow=TRUE)
     } else {
       # adapt particles using SQG DE in parallel
-      temp=matrix(unlist(parallel::parLapplyLB(cl_use, 1:control_params$n_particles, AdaptSQGDE,
-                                             current_params = particles[iter_idx, , ],   # current parameter values (numeric matrix)
-                                             current_weight = weights[iter_idx, ],  # corresponding weight (numeric vector)
-                                             objFun = ObjFun,  # function we want to minimize (returns scalar)
-                                             step_size = control_params$step_size,
-                                             jitter_size = control_params$jitter_size,
-                                             n_particles = control_params$n_particles,
-                                             crossover_rate = control_params$crossover_rate,
-                                             n_diff = control_params$n_diff, ...)),
+      temp=matrix(unlist(parallel::parLapplyLB(cl_use,
+                                               1:control_params$n_particles,
+                                               AdaptSQGDE,
+                                               current_params = particles[iter_idx, , ],   # current parameter values (numeric matrix)
+                                               current_weight = weights[iter_idx, ],  # corresponding weight (numeric vector)
+                                               objFun = ObjFun,  # function we want to minimize (returns scalar)
+                                               step_size = control_params$step_size,
+                                               jitter_size = control_params$jitter_size,
+                                               n_particles = control_params$n_particles,
+                                               crossover_rate = control_params$crossover_rate,
+                                               n_diff = control_params$n_diff, ...)),
                   control_params$n_particles,
                   control_params$n_params+1, byrow=TRUE)
 
@@ -183,10 +226,10 @@ optim_SQGDE = function(ObjFun, control_params = GetAlgoParams(), ...){
                     ncol = control_params$n_params+1, byrow=TRUE)
       } else {
         temp=matrix(unlist(parallel::parLapplyLB(cl_use, 1:control_params$n_particles, Purify,
-                                               current_params = particles[iter_idx, , ],   # current parameter values (numeric matrix)
-                                               current_weight = weights[iter_idx, ],  # corresponding weights (numeric vector)
-                                               objFun = ObjFun,  # objective function (returns scalar)
-                                               ...)),
+                                                 current_params = particles[iter_idx, , ],   # current parameter values (numeric matrix)
+                                                 current_weight = weights[iter_idx, ],  # corresponding weights (numeric vector)
+                                                 objFun = ObjFun,  # objective function (returns scalar)
+                                                 ...)),
                     control_params$n_particles,
                     control_params$n_params+1, byrow=TRUE)
       }
@@ -224,7 +267,7 @@ optim_SQGDE = function(ObjFun, control_params = GetAlgoParams(), ...){
 
 
 
-    if(iter%%control_params$print_int==0){
+    if(iter%% 100 == 0){
       message(paste0('iter ', iter, '/', control_params$n_iter))
     }
     if(iter%%control_params$thin==0 & !(iter==control_params$n_iter)){
